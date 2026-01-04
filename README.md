@@ -1,3 +1,5 @@
+# Evo2 7B gLM + ClinVar/GRCh38 Siamese Distance Scoring
+
 ## 1. 프로젝트 개요
 
 - Evo2 7B 유전체 언어모델(gLM)과 ClinVar/GRCh38 데이터를 활용해 변이(ref/var) 쌍의 거리 기반 점수를 학습하는 프로젝트입니다.
