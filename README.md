@@ -514,3 +514,574 @@ zipp                           3.23.0
 ```
 
 위 스냅샷은 개발 시점의 Runpod 환경이며, 다른 환경에서는 `requirements.txt` 기준으로 호환 가능한 버전을 설치한 뒤 실행할 수 있습니다.
+
+---
+
+# Evo2 7B gLM + ClinVar/GRCh38 Siamese Distance Scoring
+
+## 1. Project Overview
+
+- This project trains a **distance-based scoring model for variant (ref/var) pairs** using the **Evo2 7B genomic Language Model (gLM)** together with **ClinVar / GRCh38** data.
+- The **final submission model** uses **Evo2 7B embeddings + a v3 Siamese head** (`head_best_souped_v3.pt`).
+- This repository aims to include:
+  - The **entire pipeline** for data collection, preprocessing, and training
+  - **Inference code** for **Private score reproduction**
+
+---
+
+## 2. Environment Requirements
+
+### GPU
+- **NVIDIA H100 with 80GB VRAM or higher is required**
+  - Necessary for embedding computation, large-batch training, and CUDA extension builds
+
+### CUDA / Driver
+- NVIDIA Driver + CUDA Runtime **12.8 series**
+- **CUDA Toolkit (devel)**
+  - `nvcc` must be available
+  - CUDA headers (e.g., `crt/host_defines.h`) must be included  
+    (e.g., `CUDA_HOME=/usr/local/cuda`)
+
+### Software
+- **Python**: 3.12.x
+- **PyTorch**: `torch==2.8.0`
+  - Development environment used `torch==2.8.0+cu128`
+  - `torch==2.8.0+cu128` is strongly recommended
+
+> The Evo2 / flash_attn / TransformerEngine CUDA extensions used in this codebase  
+> **only work correctly on GPU servers with a full CUDA Toolkit installed**.  
+>  
+> On WSL or CPU-only environments:
+> - `flash_attn` and `transformer_engine` installation may fail
+> - Actual training and Private score reproduction assume GPU environments such as **RunPod (H100)**.
+
+### Disk
+- **At least 100GB recommended**
+
+### Network
+- **Internet connection recommended**
+  - Required to download data/models from:
+    - NCBI (ClinVar, GRCh38)
+    - Hugging Face (Evo2)
+
+### OS
+- Linux (validated on Ubuntu-based distributions)
+
+### Key Libraries
+- See `requirements.txt`
+  - Examples:
+    - `evo2==0.4.0`
+    - `transformers==4.57.3`
+    - `torch==2.8.0+cu128`
+    - `numpy==2.1.2`
+    - `pandas==2.3.3`
+
+> Environment setup can be performed by running  
+> `for_data_and_train/00_env_setup.py`.
+
+---
+
+## 3. Folder Structure
+
+### `for_data_and_train/`
+Contains the **entire pipeline** from data collection to head training, in execution order:
+
+1. `00_env_setup.py`  
+   - System and Python package installation
+2. `01_Evo2_download.py`  
+   - Download Evo2 7B model and configuration
+3. `02_data_collect_preprocess.py`  
+   - Download ClinVar / GRCh38 and generate training `.npz` files
+4. `03_evo2_embedding_full.py`  
+   - Precompute Evo2 embeddings for ref/var sequences
+5. `04_train_v0.py` ~ `07_train_v3.py`  
+   - Train Siamese heads v0 through v3
+
+### `for_data_and_train/local_data/`
+- Storage for **local datasets**:
+  - External data
+  - Preprocessed `.npz`
+  - Precomputed embeddings
+- Automatically used by scripts in `for_data_and_train/*.py`
+
+### `weights/` (optional shared model directory)
+- Can store Evo2 7B base model files
+- Example structure after download:
+  - `weights/evo2_7b/evo2_7b.pt`
+
+### `for_private_inference/`
+Contains **inference code and resources** for Private score reproduction.
+
+- `for_private_inference/data/`
+  - Local test / Private CSV files
+- `for_private_inference/weights/`
+  - Final submission head weights
+  - `head_best_souped_v3.pt` (used for Private inference)
+
+### `requirements.txt`
+- List of major libraries and versions used during development
+
+---
+
+## 4. External Data Provenance
+
+The files `00_env_setup.py`, `01_Evo2_download.py`, and  
+`02_data_collect_preprocess.py` explicitly contain URLs and code-level usage of all external resources.  
+A summarized snapshot is provided below.
+
+---
+
+### 4.1 ClinVar (GRCh38 Weekly VCF)
+
+- **Source**: NCBI ClinVar
+- **License**: Public data (freely usable)
+  - Reference: https://www.ncbi.nlm.nih.gov/clinvar/intro/
+- **Data Used**:
+  - GRCh38-based **weekly VCF**
+  - Cutoff date: `CUTOFF <= 2025-11-09`
+- **Official URL**:
+  - https://ftp.ncbi.nlm.nih.gov/pub/clinvar/vcf_GRCh38/weekly/
+- **Code**:
+  - `for_data_and_train/02_data_collect_preprocess.py`
+    - `download_clinvar_weekly()`
+    - `build_refvar_dataset()`
+- **Purpose**:
+  - Construct labeled datasets from **Pathogenic / Benign** variants
+
+---
+
+### 4.2 GRCh38 Reference Genome (FASTA)
+
+- **Source**: NCBI
+- **License**: Public human genome data (GenBank)
+  - Reference: https://www.ncbi.nlm.nih.gov/genbank/about
+- **Data Used**:
+  - `GCF_000001405.40_GRCh38.p14_genomic.fna.gz`
+- **Official URL**:
+  - https://ftp.ncbi.nlm.nih.gov/genomes/all/GCF/000/001/405/GCF_000001405.40_GRCh38.p14/
+- **Code**:
+  - `for_data_and_train/02_data_collect_preprocess.py`
+    - `download_grch38_fasta()`
+    - `get_fasta_handle_and_path()`
+- **Purpose**:
+  - Extract reference windows around ClinVar variants to build ref/var sequences
+
+---
+
+### 4.3 Evo2 7B gLM
+
+- **License**: Apache-2.0 (commercial use allowed)
+- **Source**: Hugging Face
+  - Repository: `arcinstitute/evo2_7b`
+- **Code**:
+  - `for_data_and_train/01_Evo2_download.py`
+  - `for_data_and_train/03_evo2_embedding_full.py`
+    - Load Evo2
+    - Tokenize ref/var sequences
+    - Mean-pool token embeddings from a selected layer (e.g., layer 26)
+- **Purpose**:
+  - Generate high-dimensional genomic embeddings for Siamese head training
+- **Release**: February 2025
+- **Last Update**: October 2025
+- **Usage Note**:
+  - Only checkpoints publicly available **before 2025-11-09** were used
+
+> No additional external datasets were used.
+
+---
+
+## 5. gLM and Head Model Documentation
+
+### Base gLM
+- Model: Evo2 7B (`arcinstitute/evo2_7b`)
+- Library: `evo2==0.4.0`
+- Download / Load:
+  - `01_Evo2_download.py`
+  - `03_evo2_embedding_full.py`
+
+### Siamese Projection Heads
+- **v0**
+  - Training: `04_train_v0.py`
+  - Final souped model:
+    - `ckpt_v0/seed_2025/head_best_souped_v0.pt`
+- **v1**
+  - Training: `05_train_v1.py`
+  - Final souped model:
+    - `ckpt_v1_seed2025_100ep/seed_2025/head_best_souped_v1.pt`
+- **v2**
+  - Training: `06_train_v2.py`
+  - Final souped model:
+    - `ckpt_v2_alpha_rich/seed_2025/head_best_souped_v2.pt`
+- **v3 (Final Submission)**
+  - Training: `07_train_v3.py`
+  - Final souped model:
+    - `ckpt_v3/seed_2025/head_best_souped_v3.pt`
+  - Submission / Private inference copy:
+    - `for_private_inference/weights/head_best_souped_v3.pt`
+
+---
+
+## 6. Reproducibility and Training Procedure
+
+1. **Environment setup**
+   - After creating a Python environment:
+     ```bash
+     pip install -r requirements.txt
+     ```
+   - Or run `for_data_and_train/00_env_setup.py` **(recommended)** to automatically install system/Python packages.
+     - PyTorch (`torch`) may need to be installed separately depending on GPU/driver environment, and during development it was validated on `torch==2.8.0+cu128` (H100, CUDA 12.8).
+     - You must have torch 2.8.0 or higher available, and it is recommended to use `torch==2.8.0+cu128` if possible.
+     - Depending on the environment, the `flash_attn` and `transformer_engine` packages may fail to install. These packages are required, so you must have a CUDA toolkit (dev) and an H100-class GPU or higher to install `flash_attn` and `transformer_engine`.
+
+2. **Download Evo2 gLM and configs**
+   - Run:
+     ```bash
+     python 'for_data_and_train/01_Evo2_download.py'
+     ```
+   - Outputs:
+     - `weights/evo2_7b/evo2_7b.pt`
+     - `configs/evo2-7b-1m.yml`
+
+3. **ClinVar / GRCh38 data collection and preprocessing (prepare training/preprocessing environment)**
+   - Run:
+     ```bash
+     python 'for_data_and_train/02_data_collect_preprocess.py'
+     ```
+   - Outputs:
+     - `local_data/grch38/...`
+     - `local_data/clinvar/...`
+     - `local_data/dataset/refvar_L1024_clinvar_snv_indel50.npz` etc.
+
+4. **Evo2 embedding precomputation (prepare training/preprocessing environment)**
+   - Run:
+     ```bash
+     python 'for_data_and_train/03_evo2_embedding_full.py'
+     ```
+   - Outputs:
+     - `local_data/dataset/refvar_L1024_evo2L26_emb_full.npz`
+
+5. **Siamese head training (since distillation learning is used, it is recommended to run all stages for full reproduction)**
+   - v0 training:
+     ```bash
+     python 'for_data_and_train/04_train_v0.py'
+     ```
+   - v1 training:
+     ```bash
+     python 'for_data_and_train/05_train_v1.py'
+     ```
+   - v2 training:
+     ```bash
+     python 'for_data_and_train/06_train_v2.py'
+     ```
+   - v3 training:
+     ```bash
+     python 'for_data_and_train/07_train_v3.py'
+     ```
+   - The final souped head from each stage is saved under each `ckpt_*` directory, and  
+     for submission you only place and use `head_best_souped_v3.pt` under `weights/`.
+
+---
+
+## 7. Private Score Recovery Procedure
+
+Prerequisites (only need to run once):
+- Prepare GPU/package environment with `for_data_and_train/00_env_setup.py` **(recommended)** or `pip install -r requirements.txt`
+- Prepare `weights/evo2_7b/` and `configs/evo2-7b-1m.yml` by running `for_data_and_train/01_Evo2_download.py`
+
+1. **Place official data**
+   - Mount the test/Private data provided by the competition at the **`/data` path**, or
+   - For local debugging, you can place CSV files under `for_private_inference/data/`.
+   - The filename is arbitrary, but the CSV must contain `ID` and `seq` columns.
+   - **Currently, the `data` folder includes a `test.csv` file.**
+
+2. **Verify final head weights**
+   - Ensure `for_private_inference/weights/head_best_souped_v3.pt` exists.
+
+3. **Run inference code for Private score recovery**
+   - Run the inference script inside the `for_private_inference/` folder  
+     (e.g., `run_inference_v3.py`):
+     ```bash
+     cd for_private_inference
+     python run_inference_v3.py
+     ```
+   - High-level behavior:
+     - Automatically selects the first CSV that contains `ID, seq` columns from either `/data/*.csv` or `for_private_inference/data/*.csv`,
+     - Loads `for_private_inference/weights/head_best_souped_v3.pt` and Evo2 7B,
+     - Generates a prediction file in the required submission format (`for_private_inference/private_submission_v3.csv`).
+
+4. **Private Score recovery**
+   - Upload the generated submission file to the competition platform,  
+     and you can reproduce the Private score from the original submission.
+
+---
+
+## 8. Expected Runtime (Single H100 80GB)
+
+- Data collection and preprocessing (`02_data_collect_preprocess.py`)
+  - ClinVar + GRCh38 download and npz generation: **~10 minutes**
+
+- Evo2 embedding precomputation (`03_evo2_embedding_full.py`)
+  - `refvar_L1024_clinvar_snv_indel50.npz` → Evo2 L26 embeddings: **~32 hours**
+
+- Full Siamese head training pipeline (`04_train_v0.py` ~ `07_train_v3.py`)
+  - Running v0~v3 sequentially: **~10–15 hours total**
+  - Retraining only the final model (v3): **~7–8 hours** (based on the v3 script)
+
+- Private recovery inference: **~15–20 minutes**
+
+---
+
+## 9. Development Environment Snapshot (RunPod)
+
+The following environment was used to validate development/execution (RunPod GPU instance). If you need more version details beyond the key libraries listed above, please refer to the snapshot below.
+
+```text
+============================================================
+[System] OS / Python Information
+============================================================
+Python executable : /usr/local/bin/python
+Python version    : 3.12.3
+OS               : Linux 6.8.0-56-generic
+OS version       : #58-Ubuntu SMP PREEMPT_DYNAMIC Fri Feb 14 15:33:28 UTC 2025
+Machine          : x86_64
+Processor        : x86_64
+
+============================================================
+[System] GPU / CUDA Information (torch 기준)
+============================================================
+torch version    : 2.8.0+cu128
+CUDA available   : True
+CUDA device      : NVIDIA H100 80GB HBM3
+CUDA capability  : 9.0
+Total memory     : 79.19 GB
+torch.version.cuda : 12.8
+cuDNN version      : 91002
+
+============================================================
+[Python] Major Package Versions
+============================================================
+evo2              : 0.4.0
+transformers      : 4.57.3
+accelerate        : 1.12.0
+huggingface_hub   : 0.36.0
+flash_attn        : 2.8.3
+transformer_engine: 2.10.0
+torch             : 2.8.0+cu128
+numpy             : 2.1.2
+pandas            : 2.3.3
+pysam             : 0.23.3
+datasets          : 4.4.1
+hf_transfer       : 0.1.9
+tqdm              : 4.67.1
+scipy             : 1.16.3
+requests          : 2.32.5
+
+============================================================
+[Project] Imported Library Version List
+============================================================
+
+[Python] All Installed Packages (Total 201)
+============================================================
+accelerate                     1.12.0
+aiohappyeyeballs               2.6.1
+aiohttp                        3.13.2
+aiosignal                      1.4.0
+annotated-types                0.7.0
+anyio                          4.11.0
+argon2-cffi                    25.1.0
+argon2-cffi-bindings           25.1.0
+arrow                          1.3.0
+asttokens                      3.0.0
+async-lru                      2.0.5
+attrs                          25.4.0
+autocommand                    2.2.2
+babel                          2.17.0
+backports.tarfile              1.2.0
+beautifulsoup4                 4.14.2
+biopython                      1.86
+bleach                         6.2.0
+blinker                        1.7.0
+certifi                        2025.10.5
+cffi                           2.0.0
+charset-normalizer             3.4.3
+click                          8.3.1
+comm                           0.2.3
+cryptography                   41.0.7
+datasets                       4.4.1
+dbus-python                    1.3.2
+debugpy                        1.8.17
+decorator                      5.2.1
+defusedxml                     0.7.1
+dill                           0.4.0
+distlib                        0.4.0
+distro                         1.9.0
+einops                         0.8.1
+evo2                           0.4.0
+executing                      2.2.1
+fastjsonschema                 2.21.2
+filelock                       3.20.0
+flash-attn                     2.8.3
+fqdn                           1.5.1
+frozenlist                     1.8.0
+fsspec                         2024.6.1
+h11                            0.16.0
+hf-transfer                    0.1.9
+hf-xet                         1.2.0
+httpcore                       1.0.9
+httplib2                       0.20.4
+httpx                          0.28.1
+huggingface-hub                0.36.0
+idna                           3.10
+importlib-metadata             8.7.0
+inflect                        7.3.1
+ipykernel                      6.30.1
+ipython                        9.6.0
+ipython-pygments-lexers        1.1.1
+ipywidgets                     8.1.7
+isoduration                    20.11.0
+jaraco.collections             5.1.0
+jaraco.context                 5.3.0
+jaraco.functools               4.0.1
+jaraco.text                    3.12.1
+jedi                           0.19.2
+jinja2                         3.1.6
+json5                          0.12.1
+jsonpointer                    3.0.0
+jsonschema                     4.25.1
+jsonschema-specifications      2025.9.1
+jupyter-archive                3.4.0
+jupyter-client                 8.6.3
+jupyter-core                   5.8.1
+jupyter-events                 0.12.0
+jupyter-lsp                    2.3.0
+jupyter-server                 2.17.0
+jupyter-server-terminals       0.5.3
+jupyterlab                     4.4.9
+jupyterlab-pygments            0.3.0
+jupyterlab-server              2.27.3
+jupyterlab-widgets             3.0.15
+lark                           1.3.0
+launchpadlib                   1.11.0
+lazr.restfulclient             0.14.6
+lazr.uri                       0.14.6
+markdown-it-py                 4.0.0
+markupsafe                     3.0.3
+matplotlib-inline              0.1.7
+mdurl                          0.1.2
+mistune                        3.1.4
+ml-dtypes                      0.5.4
+more-itertools                 10.3.0
+mpmath                         1.3.0
+multidict                      6.7.0
+multiprocess                   0.70.18
+nbclient                       0.10.2
+nbconvert                      7.16.6
+nbformat                       5.10.4
+nest-asyncio                   1.6.0
+networkx                       3.3
+notebook                       7.4.2
+notebook-shim                  0.2.4
+numpy                          2.1.2
+nvidia-cublas-cu12             12.8.4.1
+nvidia-cuda-cupti-cu12         12.8.90
+nvidia-cuda-nvrtc-cu12         12.8.93
+nvidia-cuda-runtime-cu12       12.8.90
+nvidia-cudnn-cu12              9.10.2.21
+nvidia-cufft-cu12              11.3.3.83
+nvidia-cufile-cu12             1.13.1.3
+nvidia-curand-cu12             10.3.9.90
+nvidia-cusolver-cu12           11.7.3.90
+nvidia-cusparse-cu12           12.5.8.93
+nvidia-cusparselt-cu12         0.7.1
+nvidia-nccl-cu12               2.27.3
+nvidia-nvjitlink-cu12          12.8.93
+nvidia-nvtx-cu12               12.8.90
+oauthlib                       3.2.2
+onnx                           1.20.0
+onnx-ir                        0.1.12
+onnxscript                     0.5.6
+packaging                      25.0
+pandas                         2.3.3
+pandocfilters                  1.5.1
+parso                          0.8.5
+pexpect                        4.9.0
+pillow                         11.0.0
+pip                            25.3
+platformdirs                   4.5.0
+prometheus-client              0.23.1
+prompt-toolkit                 3.0.52
+propcache                      0.4.1
+protobuf                       6.33.2
+psutil                         7.1.0
+ptyprocess                     0.7.0
+pure-eval                      0.2.3
+pyarrow                        22.0.0
+pycparser                      2.23
+pydantic                       2.12.5
+pydantic-core                  2.41.5
+pygments                       2.19.2
+PyGObject                      3.48.2
+PyJWT                          2.7.0
+pyparsing                      3.1.1
+pysam                          0.23.3
+python-apt                     2.7.7+ubuntu5
+python-dateutil                2.9.0.post0
+python-json-logger             4.0.0
+pytz                           2025.2
+pyyaml                         6.0.3
+pyzmq                          27.1.0
+referencing                    0.36.2
+regex                          2025.11.3
+requests                       2.32.5
+rfc3339-validator              0.1.4
+rfc3986-validator              0.1.1
+rfc3987-syntax                 1.1.0
+rich                           14.2.0
+rpds-py                        0.27.1
+safetensors                    0.7.0
+scipy                          1.16.3
+Send2Trash                     1.8.3
+setuptools                     80.9.0
+shellingham                    1.5.4
+six                            1.16.0
+sniffio                        1.3.1
+soupsieve                      2.8
+stack-data                     0.6.3
+sympy                          1.13.3
+terminado                      0.18.1
+tinycss2                       1.4.0
+tokenizers                     0.22.1
+tomli                          2.0.1
+torch                          2.8.0+cu128
+torchaudio                     2.8.0+cu128
+torchvision                    0.23.0+cu128
+tornado                        6.5.2
+tqdm                           4.67.1
+traitlets                      5.14.3
+transformer-engine             2.10.0
+transformer-engine-cu12        2.10.0
+transformer-engine-torch       2.10.0
+transformers                   4.57.3
+triton                         3.4.0
+typeguard                      4.3.0
+typer-slim                     0.20.0
+types-python-dateutil          2.9.0.20251008
+typing-extensions              4.15.0
+typing-inspection              0.4.2
+tzdata                         2025.2
+uri-template                   1.3.0
+urllib3                        2.5.0
+virtualenv                     20.34.0
+vtx                            1.0.7
+wadllib                        1.3.6
+wcwidth                        0.2.14
+webcolors                      24.11.1
+webencodings                   0.5.1
+websocket-client               1.9.0
+wheel                          0.45.1
+widgetsnbextension             4.0.14
+xxhash                         3.6.0
+yarl                           1.22.0
+zipp                           3.23.0
+```
+The snapshot above reflects the RunPod environment at development time. In other environments, you can install compatible versions based on requirements.txt and then run the code.
